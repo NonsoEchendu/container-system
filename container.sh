@@ -1,17 +1,22 @@
 #!/bin/bash
-# container.sh - Container with safer device handling
+# container.sh - Containerization implementation using Linux namespaces
+# Provides filesystem, process, network isolation, and resource control
 
-set -e  # Exit on any error
+set -e  # Exit immediately if a command exits with a non-zero status
 
-# Check for root privileges
+# -----------------------------------------------------------------------------
+# Privilege Check
+# -----------------------------------------------------------------------------
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script requires root privileges"
     exit 1
 fi
 
-# Parse arguments
-ROOT_FS="$1"
-shift  # Remove the first argument (rootfs)
+# -----------------------------------------------------------------------------
+# Argument Parsing
+# -----------------------------------------------------------------------------
+ROOT_FS="$1"  # Root filesystem path is the first argument
+shift  # Remove the first argument
 
 debug_echo() {
     echo "[DEBUG] $1"
@@ -22,26 +27,20 @@ debug_mount() {
     mount | grep "$ROOT_FS" || true
 }
 
-
-# Default values
+# Default configuration values
 ENABLE_NETWORK="true"
 CONTAINER_IP="10.0.0.2/24"
 HOST_IP="10.0.0.1/24"
 HOST_INTERFACE=$(ip route | grep default | awk '{print $5}')
-CONTAINER_UID="1000"
-CONTAINER_GID="1000"
-HOST_UID="100000"
-HOST_GID="100000"
-UID_MAP_SIZE="65536"
 VOLUMES=()
 PORTS=()
 DETACH="false"
 TRAP_SET="true"
-USE_USER_NS="false"  # Default to not using user namespaces
+USE_USER_NS="false"  # User namespace isolation is off by default
 UID_MAP="0:100000:65536"
 GID_MAP="0:100000:65536"
 
-# Parse additional network options
+# Parse command-line options
 while [[ "$1" == "--"* ]]; do
     case "$1" in
         --no-network)
@@ -84,32 +83,40 @@ while [[ "$1" == "--"* ]]; do
     esac
 done
 
+# Validate required arguments
 if [ -z "$ROOT_FS" ] || [ $# -eq 0 ]; then
     echo "Usage: $0 <rootfs_directory> [--no-network] [--container-ip IP] [--host-ip IP] <command> [args...]"
     exit 1
 fi
 
-# Unique identifier for network interfaces
+# -----------------------------------------------------------------------------
+# Container Environment Setup
+# -----------------------------------------------------------------------------
+# Generate unique identifiers for this container instance
 CONTAINER_ID=$(basename "$ROOT_FS" | sed 's/[^a-zA-Z0-9]/_/g')
 CONTAINER_NETNS="netns_${CONTAINER_ID}"
 VETH_HOST="veth_h_${CONTAINER_ID:0:8}"
 VETH_CONTAINER="veth_c_${CONTAINER_ID:0:8}"
 
-# Print PID for tracking
+# Print PID for tracking from parent process
 echo "CONTAINER_PID:$$"
 
+# -----------------------------------------------------------------------------
+# Resource Cleanup Functions
+# -----------------------------------------------------------------------------
 cleanup_stale_resources() {
     debug_echo "Cleaning up any stale resources..."
     
+    # Clean up network namespace
     debug_echo "Cleaning up network namespace..."
-    # Clean up stale network namespace
     ip netns delete "$CONTAINER_NETNS" 2>/dev/null || true
     rm -f "/run/netns/$CONTAINER_NETNS" 2>/dev/null || true
 
+    # Show current mount state
     debug_echo "Current mounts before cleanup:"
     debug_mount
     
-    # Clean up mounts in reverse order
+    # Clean up mounts in reverse order (important for nested mounts)
     debug_echo "Cleaning up stale mounts..."
     for mount_point in \
         "$ROOT_FS/dev/pts" \
@@ -127,19 +134,19 @@ cleanup_stale_resources() {
         fi
     done
     
-    # Clean up stale veth pairs
+    # Clean up network interfaces
     debug_echo "Cleaning up network interfaces..."
     ip link delete "$VETH_HOST" 2>/dev/null || true
     
-    # Remove stale NAT rules
+    # Remove NAT rules
     debug_echo "Cleaning up NAT rules..."
     iptables -t nat -D POSTROUTING -s $(echo $CONTAINER_IP | cut -d'/' -f1) -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || true
     
-    # Clean up overlay directories
+    # Clean up overlay filesystem
     debug_echo "Cleaning up overlay directories..."
     rm -rf "$ROOT_FS.upper" "$ROOT_FS.work" 2>/dev/null || true
     
-    # Ensure system is in sync
+    # Ensure changes are synced to disk
     debug_echo "Syncing filesystem..."
     sync
     sleep 1
@@ -147,10 +154,89 @@ cleanup_stale_resources() {
     debug_echo "Cleanup complete"
 }
 
+# Function to clean up mounts
+cleanup_mounts() {
+    echo "Cleaning up mounts..."
+    
+    # Unmount in proper order to avoid dependency issues
+    for mount in "$ROOT_FS/dev/pts" "$ROOT_FS/dev/shm" "$ROOT_FS/run/netns" "$ROOT_FS/tmp" "$ROOT_FS/sys" "$ROOT_FS/proc" "$ROOT_FS"; do
+        if mountpoint -q "$mount"; then
+            umount -f -l "$mount" 2>/dev/null || true
+        fi
+    done
+    
+    # Clean up overlay
+    rm -rf "$ROOT_FS.upper" "$ROOT_FS.work" 2>/dev/null || true
+    
+    # Ensure changes are synced
+    sync
+    sleep 1
+}
+
+# Function to clean up network resources
+cleanup_network() {
+    if [ "$ENABLE_NETWORK" != "true" ]; then
+        return 0
+    fi
+
+    # Clean up port forwarding first
+    cleanup_port_forwarding
+    
+    echo "Cleaning up network..."
+    
+    # Remove DNS rules
+    iptables -D FORWARD -i "$VETH_HOST" -o "$HOST_INTERFACE" -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$VETH_HOST" -o "$HOST_INTERFACE" -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$HOST_INTERFACE" -o "$VETH_HOST" -p udp --sport 53 -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$HOST_INTERFACE" -o "$VETH_HOST" -p tcp --sport 53 -j ACCEPT 2>/dev/null || true
+    
+    # Remove NAT rule
+    iptables -t nat -D POSTROUTING -s $(echo $CONTAINER_IP | cut -d'/' -f1) -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || true
+    
+    # Delete veth pair
+    ip link delete "$VETH_HOST" 2>/dev/null || true
+    
+    # Delete network namespace
+    ip netns delete "$CONTAINER_NETNS" 2>/dev/null || true
+    rm -f "/run/netns/$CONTAINER_NETNS" 2>/dev/null || true
+    
+    # Ensure changes are synced
+    sync
+    sleep 1
+}
+
+# Function to clean up port forwarding rules
+cleanup_port_forwarding() {
+    if [ "$ENABLE_NETWORK" != "true" ] || [ ${#PORTS[@]} -eq 0 ]; then
+        return 0
+    fi
+    
+    echo "Cleaning up port forwarding rules..."
+    
+    for port_mapping in "${PORTS[@]}"; do
+        host_port=$(echo "$port_mapping" | cut -d: -f1)
+        container_port=$(echo "$port_mapping" | cut -d: -f2)
+        
+        # Remove iptables rules
+        iptables -t nat -D PREROUTING -p tcp --dport "$host_port" -j DNAT \
+            --to-destination "$(echo $CONTAINER_IP | cut -d'/' -f1):$container_port" 2>/dev/null || true
+        
+        iptables -D FORWARD -p tcp -d "$(echo $CONTAINER_IP | cut -d'/' -f1)" --dport "$container_port" -j ACCEPT 2>/dev/null || true
+        
+        iptables -t nat -D OUTPUT -p tcp -d 127.0.0.1 --dport "$host_port" -j DNAT \
+            --to-destination "$(echo $CONTAINER_IP | cut -d'/' -f1):$container_port" 2>/dev/null || true
+    done
+    
+    echo "Port forwarding cleanup complete"
+}
+
+# -----------------------------------------------------------------------------
+# Filesystem Setup
+# -----------------------------------------------------------------------------
 # Function to create a minimal /dev in container
 setup_minimal_dev() {
     echo "Setting up minimal /dev environment..."
-    # Create a clean /dev directory in the container
+    # Create a clean /dev directory
     rm -rf "$ROOT_FS/dev"
     mkdir -p "$ROOT_FS/dev"
     
@@ -161,15 +247,14 @@ setup_minimal_dev() {
     mknod -m 666 "$ROOT_FS/dev/urandom" c 1 9
     mknod -m 666 "$ROOT_FS/dev/tty" c 5 0
     
-    # Create pts directory for pseudo-terminals
+    # Create and mount special directories
     mkdir -p "$ROOT_FS/dev/pts"
     mkdir -p "$ROOT_FS/dev/shm"
     
-    # Mount devpts separately to avoid affecting host
     mount -t devpts -o newinstance,ptmxmode=0666 devpts "$ROOT_FS/dev/pts" || { echo "Failed to mount devpts"; exit 1; }
     mount -t tmpfs -o mode=1777 tmpfs "$ROOT_FS/dev/shm" || { echo "Failed to mount dev/shm"; exit 1; }
     
-    # Symlinks
+    # Create symlinks
     ln -sf /proc/self/fd "$ROOT_FS/dev/fd"
     ln -sf /proc/self/fd/0 "$ROOT_FS/dev/stdin"
     ln -sf /proc/self/fd/1 "$ROOT_FS/dev/stdout"
@@ -177,55 +262,7 @@ setup_minimal_dev() {
     ln -sf /dev/pts/ptmx "$ROOT_FS/dev/ptmx"
 }
 
-# Function to setup user namespace
-# setup_user_namespace() {
-#     if [ "$USE_USER_NS" != "true" ]; then
-#         return 0
-#     fi
-    
-#     echo "Setting up user namespace mapping..."
-    
-#     # Create necessary directories and files
-#     mkdir -p "$ROOT_FS/etc" "$ROOT_FS/home/container"
-    
-#     # Create passwd and group files for container user
-#     cat > "$ROOT_FS/etc/passwd" <<EOF
-# root:x:0:0:root:/root:/bin/bash
-# container:x:1000:1000:container:/home/container:/bin/bash
-# nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
-# EOF
-
-#     cat > "$ROOT_FS/etc/group" <<EOF
-# root:x:0:root
-# container:x:1000:container
-# nobody:x:65534:nogroup
-# EOF
-
-#     # Set proper permissions
-#     chown -R 0:0 "$ROOT_FS/root"
-#     mkdir -p "$ROOT_FS/home/container"
-#     chown -R 1000:1000 "$ROOT_FS/home/container"
-#     chmod 755 "$ROOT_FS/home/container"
-    
-#     # Make sure /tmp is writable by the container user
-#     chmod 1777 "$ROOT_FS/tmp"
-    
-#     # Create a user switching script
-#     mkdir -p "$ROOT_FS/usr/local/bin"
-#     cat > "$ROOT_FS/usr/local/bin/run-as-user" << 'EOF'
-# #!/bin/bash
-# if [ "$1" = "user" ]; then
-#     shift
-#     exec su - container -c "$*"
-# else
-#     exec "$@"
-# fi
-# EOF
-#     chmod 755 "$ROOT_FS/usr/local/bin/run-as-user"
-    
-#     echo "User namespace setup complete"
-# }
-
+# Function to set up user namespace isolation
 setup_user_namespace() {
     if [ "$USE_USER_NS" != "true" ]; then
         return 0
@@ -255,13 +292,13 @@ EOF
     chown -R 1000:1000 "$ROOT_FS/home/container"
     chmod 755 "$ROOT_FS/home/container"
     
-    # Make sure /tmp is writable by the container user
+    # Ensure tmp is writable
     chmod 1777 "$ROOT_FS/tmp"
     
     echo "User isolation setup complete"
 }
 
-# Function to set up mount points safely
+# Function to set up mount points
 setup_mounts() {
     debug_echo "Starting mount setup..."
     mkdir -p "$ROOT_FS/proc" "$ROOT_FS/sys" "$ROOT_FS/run" "$ROOT_FS/tmp"
@@ -271,7 +308,7 @@ setup_mounts() {
     mkdir -p "$ROOT_FS/run/netns"
     mkdir -p "/run/netns"  # Ensure host directory exists
     
-    # Mount essential filesystems with better error handling
+    # Mount essential filesystems
     debug_echo "Mounting proc filesystem..."
     mount -t proc proc "$ROOT_FS/proc" || { echo "Failed to mount proc"; exit 1; }
     debug_echo "Mounting sysfs filesystem..."
@@ -279,7 +316,7 @@ setup_mounts() {
     debug_echo "Mounting tmpfs filesystem..."
     mount -t tmpfs tmpfs "$ROOT_FS/tmp" || { echo "Failed to mount tmp"; exit 1; }
     
-    # Create network namespace file and mount it
+    # Setup network namespace access from container
     debug_echo "Setting up network namespace mount..."
     touch "/run/netns/$CONTAINER_NETNS" 2>/dev/null || true
     mkdir -p "$ROOT_FS/run/netns"
@@ -288,7 +325,7 @@ setup_mounts() {
         exit 1;
     }
     
-    # Set up a minimal dev environment
+    # Set up device nodes
     debug_echo "Setting up minimal dev environment..."
     setup_minimal_dev
     
@@ -308,55 +345,10 @@ setup_mounts() {
     fi
 }
 
-# Function to clean up mounts - safer version
-cleanup_mounts() {
-    echo "Cleaning up mounts..."
-    
-    # Clean up specific mount points in reverse order
-    for mount in "$ROOT_FS/dev/pts" "$ROOT_FS/dev/shm" "$ROOT_FS/run/netns" "$ROOT_FS/tmp" "$ROOT_FS/sys" "$ROOT_FS/proc" "$ROOT_FS"; do
-        if mountpoint -q "$mount"; then
-            umount -f -l "$mount" 2>/dev/null || true
-        fi
-    done
-    
-    # Remove overlay directories if they exist
-    rm -rf "$ROOT_FS.upper" "$ROOT_FS.work" 2>/dev/null || true
-    
-    # Ensure changes are synced
-    sync
-    sleep 1
-}
-
-setup_dns() {
-    echo "Setting up DNS configuration..."
-    
-    # Create resolv.conf directory if it doesn't exist
-    mkdir -p "$ROOT_FS/etc"
-    
-    # Get host's DNS servers
-    HOST_DNS=$(grep nameserver /etc/resolv.conf | awk '{print $2}' | head -n 1)
-    if [ -z "$HOST_DNS" ]; then
-        HOST_DNS="8.8.8.8"
-    fi
-    
-    # Create resolv.conf with host's DNS and Google DNS as backup
-    cat > "$ROOT_FS/etc/resolv.conf" <<EOF
-nameserver $HOST_DNS
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-options single-request-reopen
-EOF
-
-    # Ensure proper permissions
-    chmod 644 "$ROOT_FS/etc/resolv.conf"
-    
-    # Add DNS server IP to container's routing table
-    ip netns exec "$CONTAINER_NETNS" ip route add $HOST_DNS via $(echo $HOST_IP | cut -d'/' -f1) 2>/dev/null || true
-    
-    echo "DNS configuration complete. Using nameservers: $HOST_DNS, 8.8.8.8"
-}
-
-# Function to set up network for the container - safer version
+# -----------------------------------------------------------------------------
+# Network Setup
+# -----------------------------------------------------------------------------
+# Function to set up network namespace and interfaces
 setup_network() {
     if [ "$ENABLE_NETWORK" != "true" ]; then
         echo "Networking disabled for this container"
@@ -369,13 +361,13 @@ setup_network() {
     ip netns delete "$CONTAINER_NETNS" 2>/dev/null || true
     rm -f "/run/netns/$CONTAINER_NETNS" 2>/dev/null || true
     
-    # Create network namespace
+    # Create new network namespace
     ip netns add "$CONTAINER_NETNS" || { 
         echo "Failed to create network namespace"; 
         exit 1; 
     }
     
-    # Create veth pair
+    # Create virtual ethernet pair
     ip link add name "$VETH_HOST" type veth peer name "$VETH_CONTAINER" || { 
         echo "Failed to create veth pair"; 
         cleanup_network;
@@ -413,7 +405,6 @@ setup_network() {
     iptables -A FORWARD -i "$VETH_HOST" -o "$HOST_INTERFACE" -p tcp --dport 53 -j ACCEPT
     iptables -A FORWARD -i "$HOST_INTERFACE" -o "$VETH_HOST" -p udp --sport 53 -j ACCEPT
     iptables -A FORWARD -i "$HOST_INTERFACE" -o "$VETH_HOST" -p tcp --sport 53 -j ACCEPT
-    
 
     # Setup DNS
     setup_dns
@@ -421,11 +412,43 @@ setup_network() {
     echo "Network setup complete. Container IP: $(echo $CONTAINER_IP | cut -d'/' -f1)"
 }
 
-# Function for volume setup
+# Function to configure DNS resolution
+setup_dns() {
+    echo "Setting up DNS configuration..."
+    
+    # Create resolv.conf directory
+    mkdir -p "$ROOT_FS/etc"
+    
+    # Get host's DNS servers
+    HOST_DNS=$(grep nameserver /etc/resolv.conf | awk '{print $2}' | head -n 1)
+    if [ -z "$HOST_DNS" ]; then
+        HOST_DNS="8.8.8.8"
+    fi
+    
+    # Create resolv.conf with host's DNS and Google DNS as backup
+    cat > "$ROOT_FS/etc/resolv.conf" <<EOF
+nameserver $HOST_DNS
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+options single-request-reopen
+EOF
+
+    chmod 644 "$ROOT_FS/etc/resolv.conf"
+    
+    # Add route to DNS server
+    ip netns exec "$CONTAINER_NETNS" ip route add $HOST_DNS via $(echo $HOST_IP | cut -d'/' -f1) 2>/dev/null || true
+    
+    echo "DNS configuration complete. Using nameservers: $HOST_DNS, 8.8.8.8"
+}
+
+# -----------------------------------------------------------------------------
+# Volume and Port Management
+# -----------------------------------------------------------------------------
+# Function to set up volume mounts
 setup_volumes() {
     debug_echo "Setting up volume mounts..."
     for volume in "${VOLUMES[@]}"; do
-        # Parse volume string
+        # Parse volume string (format: host_path:container_path[:ro])
         host_path=$(echo "$volume" | cut -d: -f1)
         container_path=$(echo "$volume" | cut -d: -f2)
         options=$(echo "$volume" | cut -d: -f3 -s)
@@ -436,7 +459,7 @@ setup_volumes() {
         # Create mount point in container
         mkdir -p "$ROOT_FS$container_path"
         
-        # Mount options
+        # Set mount options
         mount_opts="rbind"
         if [ "$options" == "ro" ]; then
             mount_opts="rbind,ro"
@@ -444,15 +467,16 @@ setup_volumes() {
         
         debug_echo "Mounting $host_path to $container_path with options: $mount_opts"
 
-        # Make sure source directory exists and is accessible
+        # Verify source directory
         if [ ! -d "$host_path" ]; then
             echo "Error: Host path $host_path does not exist or is not a directory"
             return 1
         fi
 
+        # Ensure the mount is private to avoid propagation issues
         mount --make-rprivate "$host_path" || true
 
-        # Attempt mount
+        # Perform mount operation
         if ! mount -o "$mount_opts" "$host_path" "$ROOT_FS$container_path"; then
             echo "Error: Failed to mount $host_path to $container_path"
             return 1
@@ -462,6 +486,7 @@ setup_volumes() {
     done
 }
 
+# Function to set up port forwarding
 setup_port_forwarding() {
     if [ "$ENABLE_NETWORK" != "true" ] || [ ${#PORTS[@]} -eq 0 ]; then
         return 0
@@ -475,14 +500,14 @@ setup_port_forwarding() {
         
         echo "Mapping host port $host_port to container port $container_port"
         
-        # Set up iptables DNAT rule to forward traffic
+        # DNAT rule to forward incoming traffic to container
         iptables -t nat -A PREROUTING -p tcp --dport "$host_port" -j DNAT \
             --to-destination "$(echo $CONTAINER_IP | cut -d'/' -f1):$container_port"
         
-        # Allow forwarded traffic to reach the container
+        # Allow forwarded traffic to reach container
         iptables -A FORWARD -p tcp -d "$(echo $CONTAINER_IP | cut -d'/' -f1)" --dport "$container_port" -j ACCEPT
         
-        # For local connections on the host
+        # For local connections on host
         iptables -t nat -A OUTPUT -p tcp -d 127.0.0.1 --dport "$host_port" -j DNAT \
             --to-destination "$(echo $CONTAINER_IP | cut -d'/' -f1):$container_port"
     done
@@ -490,6 +515,7 @@ setup_port_forwarding() {
     echo "Port forwarding setup complete"
 }
 
+# Function to save port forwarding configuration
 save_port_forwarding_config() {
     if [ "$ENABLE_NETWORK" != "true" ] || [ ${#PORTS[@]} -eq 0 ]; then
         return 0
@@ -499,26 +525,23 @@ save_port_forwarding_config() {
     mkdir -p "/var/run/simple-container/$CONTAINER_ID"
     PORT_CONFIG="/var/run/simple-container/$CONTAINER_ID/ports.conf"
     
-    # Save port info and container IP for later cleanup
+    # Save port config for later cleanup
     echo "CONTAINER_IP=$(echo $CONTAINER_IP | cut -d'/' -f1)" > "$PORT_CONFIG"
     echo "HOST_INTERFACE=$HOST_INTERFACE" >> "$PORT_CONFIG"
     echo "PORTS=${PORTS[*]}" >> "$PORT_CONFIG"
     
-    # Let's also set up the iptables rules again to make sure they're active
+    # Re-apply port forwarding rules to ensure they're active
     echo "Re-applying port forwarding rules..."
     
     for port_mapping in "${PORTS[@]}"; do
         host_port=$(echo "$port_mapping" | cut -d: -f1)
         container_port=$(echo "$port_mapping" | cut -d: -f2)
         
-        # Set up iptables DNAT rule to forward traffic
         iptables -t nat -A PREROUTING -p tcp --dport "$host_port" -j DNAT \
             --to-destination "$(echo $CONTAINER_IP | cut -d'/' -f1):$container_port"
         
-        # Allow forwarded traffic to reach the container
         iptables -A FORWARD -p tcp -d "$(echo $CONTAINER_IP | cut -d'/' -f1)" --dport "$container_port" -j ACCEPT
         
-        # For local connections on the host
         iptables -t nat -A OUTPUT -p tcp -d 127.0.0.1 --dport "$host_port" -j DNAT \
             --to-destination "$(echo $CONTAINER_IP | cut -d'/' -f1):$container_port"
     done
@@ -526,79 +549,27 @@ save_port_forwarding_config() {
     echo "Port forwarding rules saved and re-applied"
 }
 
-cleanup_port_forwarding() {
-    if [ "$ENABLE_NETWORK" != "true" ] || [ ${#PORTS[@]} -eq 0 ]; then
-        return 0
-    fi
-    
-    echo "Cleaning up port forwarding rules..."
-    
-    for port_mapping in "${PORTS[@]}"; do
-        host_port=$(echo "$port_mapping" | cut -d: -f1)
-        container_port=$(echo "$port_mapping" | cut -d: -f2)
-        
-        # Remove the iptables rules
-        iptables -t nat -D PREROUTING -p tcp --dport "$host_port" -j DNAT \
-            --to-destination "$(echo $CONTAINER_IP | cut -d'/' -f1):$container_port" 2>/dev/null || true
-        
-        iptables -D FORWARD -p tcp -d "$(echo $CONTAINER_IP | cut -d'/' -f1)" --dport "$container_port" -j ACCEPT 2>/dev/null || true
-        
-        iptables -t nat -D OUTPUT -p tcp -d 127.0.0.1 --dport "$host_port" -j DNAT \
-            --to-destination "$(echo $CONTAINER_IP | cut -d'/' -f1):$container_port" 2>/dev/null || true
-    done
-    
-    echo "Port forwarding cleanup complete"
-}
-
-# Function to clean up network - safer version
-cleanup_network() {
-    if [ "$ENABLE_NETWORK" != "true" ]; then
-        return 0
-    fi
-
-    cleanup_port_forwarding
-    
-    echo "Cleaning up network..."
-    
-    # Remove DNS rules
-    iptables -D FORWARD -i "$VETH_HOST" -o "$HOST_INTERFACE" -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$VETH_HOST" -o "$HOST_INTERFACE" -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$HOST_INTERFACE" -o "$VETH_HOST" -p udp --sport 53 -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$HOST_INTERFACE" -o "$VETH_HOST" -p tcp --sport 53 -j ACCEPT 2>/dev/null || true
-    
-    # Remove NAT rule
-    iptables -t nat -D POSTROUTING -s $(echo $CONTAINER_IP | cut -d'/' -f1) -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || true
-    
-    # Delete veth pair
-    ip link delete "$VETH_HOST" 2>/dev/null || true
-    
-    # Delete network namespace
-    ip netns delete "$CONTAINER_NETNS" 2>/dev/null || true
-    rm -f "/run/netns/$CONTAINER_NETNS" 2>/dev/null || true
-    
-    # Ensure changes are synced
-    sync
-    sleep 1
-}
-
+# -----------------------------------------------------------------------------
+# MAIN EXECUTION FLOW
+# -----------------------------------------------------------------------------
 # Clean up any stale resources before starting
 cleanup_stale_resources
 
-# Ensure cleanup happens on script exit
+# Set up cleanup trap for graceful termination
 if [ "$TRAP_SET" == "true" ]; then
     trap 'cleanup_mounts; cleanup_network' EXIT INT TERM
 fi
 
-# Set up the mounts
+# Set up core container environment
 setup_mounts
-
-# Set up the network
 setup_network
+
+# Set up port forwarding if needed
 if [ "$ENABLE_NETWORK" == "true" ]; then
     setup_port_forwarding
 fi
 
-# Set up user namespace
+# Set up user isolation if requested
 if [ "$USE_USER_NS" == "true" ]; then
     setup_user_namespace
 fi
@@ -606,16 +577,20 @@ fi
 echo "Running command in container: $*"
 debug_echo "Starting container execution..."
 
-# Prepare command based on user namespace setting
+# -----------------------------------------------------------------------------
+# Container Command Execution
+# -----------------------------------------------------------------------------
+# Prepare command based on user isolation setting
 if [ "$USE_USER_NS" == "true" ]; then
-    # For user namespace, we want to run as the container user
-    USER_CMD="/usr/local/bin/run-as-user user \"$*\""
+    # When using user namespace, run as non-root container user
+    USER_CMD="su - container -c '$*'"
 else
     # Without user namespace, run as root
     USER_CMD="$*"
 fi
 
 if [ "$DETACH" == "true" ]; then
+    # Setup for detached execution
     COMMAND_SCRIPT=$(mktemp)
     cat > "$COMMAND_SCRIPT" << EOF
 #!/bin/bash
@@ -628,59 +603,32 @@ EOF
     
     if [ "$ENABLE_NETWORK" == "true" ]; then
         debug_echo "Using network namespace: $CONTAINER_NETNS"
-        if [ "$USE_USER_NS" == "true" ]; then
-            # With user namespace
-            ip netns exec "$CONTAINER_NETNS" unshare \
-                --mount \
-                --uts \
-                --ipc \
-                --pid \
-                --user \
-                --fork \
-                --map-root-user \
-                chroot "$ROOT_FS" nohup bash -c "$*" > /tmp/container.log 2>&1 &
-        else
-            # Original code without user namespace
-            ip netns exec "$CONTAINER_NETNS" unshare \
-                --mount \
-                --uts \
-                --ipc \
-                --pid \
-                --fork \
-                chroot "$ROOT_FS" nohup bash -c "$*" > /tmp/container.log 2>&1 &
-        fi
+        # Run with network namespace
+        ip netns exec "$CONTAINER_NETNS" unshare \
+            --mount \
+            --uts \
+            --ipc \
+            --pid \
+            --fork \
+            chroot "$ROOT_FS" nohup bash -c "$*" > /tmp/container.log 2>&1 &
         CONTAINER_BACKGROUND_PID=$!
         echo $CONTAINER_BACKGROUND_PID > "$CONTAINER_PID_FILE"
     else
         debug_echo "Starting without network namespace"
-        if [ "$USE_USER_NS" == "true" ]; then
-            # With user namespace, no network
-            unshare \
-                --mount \
-                --net \
-                --uts \
-                --ipc \
-                --pid \
-                --user \
-                --fork \
-                --map-root-user \
-                chroot "$ROOT_FS" nohup bash -c "$*" > /tmp/container.log 2>&1 &
-        else
-            # Original code without user namespace
-            unshare \
-                --mount \
-                --net \
-                --uts \
-                --ipc \
-                --pid \
-                --fork \
-                chroot "$ROOT_FS" nohup bash -c "$*" > /tmp/container.log 2>&1 &
-        fi
+        # Run without network namespace
+        unshare \
+            --mount \
+            --net \
+            --uts \
+            --ipc \
+            --pid \
+            --fork \
+            chroot "$ROOT_FS" nohup bash -c "$*" > /tmp/container.log 2>&1 &
         CONTAINER_BACKGROUND_PID=$!
         echo $CONTAINER_BACKGROUND_PID > "$CONTAINER_PID_FILE"
     fi
     
-    # Save port forwarding configuration
+    # Save port configuration for later use
     save_port_forwarding_config
     
     # Give it a moment to start
@@ -688,56 +636,29 @@ EOF
     echo "Container ready"
     exit_status=0
 else
-    # Regular execution (non-detached)
+    # Foreground execution
     if [ "$ENABLE_NETWORK" == "true" ]; then
         debug_echo "Using network namespace: $CONTAINER_NETNS"
-        if [ "$USE_USER_NS" == "true" ]; then
-            # With user namespace and network
-            ip netns exec "$CONTAINER_NETNS" unshare \
-                --mount \
-                --uts \
-                --ipc \
-                --pid \
-                --user \
-                --fork \
-                --map-root-user \
-                chroot "$ROOT_FS" bash -c "$USER_CMD"
-        else
-            # Without user namespace
-            ip netns exec "$CONTAINER_NETNS" unshare \
-                --mount \
-                --uts \
-                --ipc \
-                --pid \
-                --fork \
-                chroot "$ROOT_FS" bash -c "$USER_CMD"
-        fi
+        # Execute in network namespace
+        ip netns exec "$CONTAINER_NETNS" unshare \
+            --mount \
+            --uts \
+            --ipc \
+            --pid \
+            --fork \
+            chroot "$ROOT_FS" bash -c "$USER_CMD"
         exit_status=$?
     else
         debug_echo "Starting without network namespace"
-        if [ "$USE_USER_NS" == "true" ]; then
-            # With user namespace, no network
-            unshare \
-                --mount \
-                --net \
-                --uts \
-                --ipc \
-                --pid \
-                --user \
-                --fork \
-                --map-root-user \
-                chroot "$ROOT_FS" bash -c "$USER_CMD"
-        else
-            # Without user namespace
-            unshare \
-                --mount \
-                --net \
-                --uts \
-                --ipc \
-                --pid \
-                --fork \
-                chroot "$ROOT_FS" bash -c "$USER_CMD"
-        fi
+        # Execute without network namespace
+        unshare \
+            --mount \
+            --net \
+            --uts \
+            --ipc \
+            --pid \
+            --fork \
+            chroot "$ROOT_FS" bash -c "$USER_CMD"
         exit_status=$?
     fi
 fi
