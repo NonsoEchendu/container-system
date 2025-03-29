@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-# simple_container.py - Basic container manager
+"""
+simple_container.py - Basic container manager using Linux namespaces
+
+Provides a Python interface for creating, managing, and monitoring
+containers with resource limits, networking, and volume mounts.
+"""
 
 import os
 import sys
@@ -9,12 +14,23 @@ import uuid
 import time
 import json
 import signal
-import shlex
 import select
+import shutil
+from pathlib import Path
+
 
 class SimpleContainer:
+    """Manages container lifecycle and resources"""
+    
     def __init__(self, rootfs, name=None):
-        self.rootfs = os.path.abspath(rootfs)
+        """
+        Initialize a container instance
+        
+        Args:
+            rootfs: Path to container root filesystem
+            name: Optional container name (generated if not provided)
+        """
+        self.rootfs = os.path.abspath(rootfs) if rootfs else None
         self.name = name or f"container_{uuid.uuid4().hex[:8]}"
         self.pid = None
         
@@ -39,13 +55,20 @@ class SimpleContainer:
             json.dump(self.config, f, indent=2)
     
     def setup_cgroups(self, cpu_percent=50, memory_limit="256M"):
-        """Set up cgroups for the container"""
+        """
+        Set up cgroups for resource limits
+        
+        Args:
+            cpu_percent: CPU usage limit as percentage
+            memory_limit: Memory limit with unit (e.g., "256M")
+        """
         print(f"Setting up resource limits for {self.name}...")
         
         try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
             subprocess.run([
                 "/bin/bash", 
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgroups.sh"),
+                os.path.join(script_dir, "cgroups.sh"),
                 self.name, 
                 str(cpu_percent), 
                 memory_limit
@@ -61,10 +84,28 @@ class SimpleContainer:
             print("Continuing without resource limits...")
 
     def start(self, command, cpu_percent=50, memory_limit="256M", 
-          network=True, container_ip="10.0.0.2/24", host_ip="10.0.0.1/24", 
-          volumes=None, ports=None, use_userns=False, uid_map="0:100000:65536", 
-          gid_map="0:100000:65536"):
-        """Start the container with the given command"""
+              network=True, container_ip="10.0.0.2/24", host_ip="10.0.0.1/24", 
+              volumes=None, ports=None, use_userns=False, uid_map="0:100000:65536", 
+              gid_map="0:100000:65536"):
+        """
+        Start the container with the given command
+        
+        Args:
+            command: Command to run inside the container
+            cpu_percent: CPU usage limit as percentage
+            memory_limit: Memory limit with unit (e.g., "256M")
+            network: Whether to enable networking
+            container_ip: IP address for the container
+            host_ip: IP address for the host end of connection
+            volumes: List of volume mounts (host:container[:ro])
+            ports: List of port mappings (host:container)
+            use_userns: Whether to enable user namespace isolation
+            uid_map: UID mapping for user namespace
+            gid_map: GID mapping for user namespace
+            
+        Returns:
+            bool: True if container started successfully, False otherwise
+        """
         print(f"Starting container {self.name}...")
         
         if self.pid:
@@ -72,44 +113,15 @@ class SimpleContainer:
             return False
         
         detach = True
-
-        # Define pid_file at the start of the method
         pid_file = f"{self.container_dir}/container.pid"
 
         # Validate volume mounts
-        if volumes:
-            for volume in volumes:
-                host_path, container_path = volume.split(':')[:2]
-                if not os.path.exists(os.path.expanduser(host_path)):  # Add expanduser for ~
-                    print(f"Error: Host path {host_path} does not exist")
-                    return False
-                # Convert to absolute paths
-                host_path = os.path.abspath(os.path.expanduser(host_path))
-                if not container_path.startswith('/'):
-                    print(f"Error: Container path {container_path} must be absolute")
-                    return False
+        if not self._validate_volumes(volumes):
+            return False
         
         # Validate port mappings
-        if ports and not network:
-            print("Error: Port forwarding requires networking to be enabled")
+        if not self._validate_ports(ports, network):
             return False
-
-        if ports:
-            for port_mapping in ports:
-                if ':' not in port_mapping:
-                    print(f"Error: Invalid port mapping format: {port_mapping}")
-                    print("Port mapping should be in the format: HOST_PORT:CONTAINER_PORT")
-                    return False
-                host_port, container_port = port_mapping.split(':')
-                try:
-                    host_port = int(host_port)
-                    container_port = int(container_port)
-                except ValueError:
-                    print(f"Error: Ports must be numeric: {port_mapping}")
-                    return False
-                if host_port < 1 or host_port > 65535 or container_port < 1 or container_port > 65535:
-                    print(f"Error: Ports must be between 1 and 65535: {port_mapping}")
-                    return False
 
         # Force cleanup before starting
         print("Cleaning up any stale resources...")
@@ -120,16 +132,78 @@ class SimpleContainer:
         self.setup_cgroups(cpu_percent, memory_limit)
         
         # Start the container
-        print("Starting container process...")
-        container_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "container.sh")
+        return self._execute_container(
+            command, network, container_ip, host_ip,
+            volumes, ports, use_userns, uid_map, gid_map,
+            detach, pid_file
+        )
+
+    def _validate_volumes(self, volumes):
+        """Validate volume mount specifications"""
+        if not volumes:
+            return True
+            
+        for volume in volumes:
+            host_path, container_path = volume.split(':')[:2]
+            host_path = os.path.expanduser(host_path)
+            
+            if not os.path.exists(host_path):
+                print(f"Error: Host path {host_path} does not exist")
+                return False
+                
+            # Convert to absolute paths
+            host_path = os.path.abspath(host_path)
+            if not container_path.startswith('/'):
+                print(f"Error: Container path {container_path} must be absolute")
+                return False
+                
+        return True
+    
+    def _validate_ports(self, ports, network):
+        """Validate port forwarding specifications"""
+        if not ports:
+            return True
+            
+        if not network:
+            print("Error: Port forwarding requires networking to be enabled")
+            return False
+
+        for port_mapping in ports:
+            if ':' not in port_mapping:
+                print(f"Error: Invalid port mapping format: {port_mapping}")
+                print("Port mapping should be in the format: HOST_PORT:CONTAINER_PORT")
+                return False
+                
+            host_port, container_port = port_mapping.split(':')
+            try:
+                host_port = int(host_port)
+                container_port = int(container_port)
+            except ValueError:
+                print(f"Error: Ports must be numeric: {port_mapping}")
+                return False
+                
+            if host_port < 1 or host_port > 65535 or container_port < 1 or container_port > 65535:
+                print(f"Error: Ports must be between 1 and 65535: {port_mapping}")
+                return False
+                
+        return True
+
+    def _execute_container(self, command, network, container_ip, host_ip,
+                          volumes, ports, use_userns, uid_map, gid_map,
+                          detach, pid_file):
+        """Execute the container process with all specified options"""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        container_script = os.path.join(script_dir, "container.sh")
         
         try:
+            # Build container command arguments
             container_args = [
                 "sudo",
                 container_script,
                 self.rootfs
             ]
             
+            # Add network options
             if network:
                 container_args.extend([
                     "--container-ip", container_ip,
@@ -147,7 +221,7 @@ class SimpleContainer:
             # Add volume mounts
             if volumes:
                 for volume in volumes:
-                    host_path = os.path.expanduser(volume.split(':')[0])  # Expand ~ in path
+                    host_path = os.path.expanduser(volume.split(':')[0])
                     container_args.extend(["--volume", volume])
 
             # Add port mappings
@@ -155,16 +229,16 @@ class SimpleContainer:
                 for port_mapping in ports:
                     container_args.extend(["--port", port_mapping])
 
-            # Add the --detach flag for commands that should run in the background
+            # Add the --detach flag for background execution
             if detach:
                 container_args.append("--detach")
             
-            # Use a single argument for the command
+            # Add the command to run
             container_args.append(command)
             
-            print(f"Building command arguments...")
             print(f"Executing command: {' '.join(container_args)}")
             
+            # Start the container process
             process = subprocess.Popen(
                 container_args,
                 stdout=subprocess.PIPE,
@@ -173,18 +247,34 @@ class SimpleContainer:
                 preexec_fn=os.setsid
             )
             
-            # Read output in real-time
-            pid = None
-            start_time = time.time()
-            ready = False
-            max_startup_time = 30  # 30 seconds to start
+            # Monitor container startup
+            return self._monitor_container_startup(
+                process, detach, pid_file
+            )
+                
+        except Exception as e:
+            print(f"Failed to start container: {e}")
+            if hasattr(e, 'output'):
+                print(f"Output: {e.output}")
+            self.cleanup_container()
+            return False
 
+    def _monitor_container_startup(self, process, detach, pid_file):
+        """Monitor container process during startup phase"""
+        pid = None
+        start_time = time.time()
+        ready = False
+        max_startup_time = 30  # 30 seconds to start
+
+        try:
             while True:
-                if time.time() - start_time > max_startup_time:  # Use max_startup_time instead of timeout
+                # Check for timeout
+                if time.time() - start_time > max_startup_time:
                     print("Container execution timed out")
                     os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                     self.cleanup_container()
                     return False
+                    
                 # Read from both stdout and stderr
                 stdout_ready = select.select([process.stdout], [], [], 0.1)[0]
                 stderr_ready = select.select([process.stderr], [], [], 0.1)[0]
@@ -199,33 +289,13 @@ class SimpleContainer:
                         if "Container ready" in line:
                             ready = True
                             if detach:
-                                break  # We can exit the loop when the container is ready
+                                break  # Exit loop when container is ready in detached mode
                 
                 if stderr_ready:
                     line = process.stderr.readline()
                     if line:
                         print("STDERR:", line.strip())
 
-                # Check for timeout
-                if time.time() - start_time > max_startup_time:
-                    if pid:
-                        # If we have a PID, the container is running
-                        print("Container started successfully, command running in background")
-                        ready = True
-                        break
-                    else:
-                        print("Container execution timed out")
-                        process.terminate()
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                        self.cleanup_container()
-                        return False
-                
-                # Short sleep to avoid busy-waiting
-                time.sleep(0.1)
-                
                 # Check if process has ended
                 if process.poll() is not None:
                     # Read any remaining output
@@ -235,19 +305,8 @@ class SimpleContainer:
                         print("STDERR:", line.strip())
                     break
                 
-                # Check for keyboard interrupt
-                try:
-                    time.sleep(0.1)
-                except KeyboardInterrupt:
-                    print("\nReceived interrupt, stopping container...")
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    self.cleanup_container()
-                    print("Container terminated by user")
-                    return False
+                # Short sleep to avoid busy-waiting
+                time.sleep(0.1)
             
             # Get the exit status
             exit_status = process.poll()
@@ -261,11 +320,12 @@ class SimpleContainer:
                 with open(pid_file, 'w') as f:
                     f.write(str(self.pid))
                 
+                # Update container status
                 self.config["status"] = "running"
                 self.config["pid"] = self.pid
                 self.config["started"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
                 self.config["network"] = {
-                    "enabled": network,
+                    "enabled": network := True,
                     "container_ip": container_ip if network else None
                 }
                 self.save_config()
@@ -276,18 +336,27 @@ class SimpleContainer:
                 self.cleanup_container()
                 return False
                 
-        except Exception as e:
-            print(f"Failed to start container: {e}")
-            if hasattr(e, 'output'):
-                print(f"Output: {e.output}")
+        except KeyboardInterrupt:
+            print("\nReceived interrupt, stopping container...")
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
             self.cleanup_container()
+            print("Container terminated by user")
             return False
-        finally:
-            if 'process' in locals() and process.poll() is not None and process.poll() != 0:
-                self.cleanup_container()
 
     def stop(self, timeout=10):
-        """Stop the container"""
+        """
+        Stop the container
+        
+        Args:
+            timeout: Seconds to wait for graceful shutdown before force killing
+            
+        Returns:
+            bool: True if container stopped successfully, False otherwise
+        """
         print(f"Stopping container {self.name}...")
         
         if not self.pid:
@@ -311,68 +380,19 @@ class SimpleContainer:
                 # If timeout reached, force kill
                 try:
                     os.kill(self.pid, signal.SIGKILL)
-                    time.sleep(0.5)  # Give it a moment to die
+                    time.sleep(0.5)
                 except OSError:
                     pass
             
-            # Ensure all child processes are cleaned up
+            # Clean up child processes
             try:
                 subprocess.run(["pkill", "-P", str(self.pid)], check=False)
             except subprocess.SubprocessError:
                 pass
             
-            # Clean up any lingering mounts
+            # Clean up mounts and network resources
             self._cleanup_mounts()
-            
-            # Clean up port forwarding if it was used
-            container_id = os.path.basename(self.rootfs).replace('/', '_')
-            port_config_file = f"/var/run/simple-container/{container_id}/ports.conf"
-            if os.path.exists(port_config_file):
-                print(f"Cleaning up port forwarding rules...")
-                try:
-                    # Read the port config
-                    port_config = {}
-                    with open(port_config_file, 'r') as f:
-                        for line in f:
-                            if '=' in line:
-                                key, value = line.strip().split('=', 1)
-                                port_config[key] = value
-                    
-                    # Clean up port forwarding rules
-                    if 'PORTS' in port_config and 'CONTAINER_IP' in port_config:
-                        ports = port_config['PORTS'].split()
-                        container_ip = port_config['CONTAINER_IP']
-                        host_interface = port_config.get('HOST_INTERFACE', 'eth0')
-                        
-                        for port_mapping in ports:
-                            host_port, container_port = port_mapping.split(':')
-                            print(f"Removing port mapping {host_port}:{container_port}")
-                            
-                            # Remove the iptables rules
-                            subprocess.run([
-                                'sudo', 'iptables', '-t', 'nat', '-D', 'PREROUTING',
-                                '-p', 'tcp', '--dport', host_port, '-j', 'DNAT',
-                                '--to-destination', f"{container_ip}:{container_port}"
-                            ], stderr=subprocess.DEVNULL, check=False)
-                            
-                            subprocess.run([
-                                'sudo', 'iptables', '-D', 'FORWARD',
-                                '-p', 'tcp', '-d', container_ip, '--dport', container_port,
-                                '-j', 'ACCEPT'
-                            ], stderr=subprocess.DEVNULL, check=False)
-                            
-                            subprocess.run([
-                                'sudo', 'iptables', '-t', 'nat', '-D', 'OUTPUT',
-                                '-p', 'tcp', '-d', '127.0.0.1', '--dport', host_port,
-                                '-j', 'DNAT', '--to-destination', f"{container_ip}:{container_port}"
-                            ], stderr=subprocess.DEVNULL, check=False)
-                    
-                    # Remove the port config file
-                    os.remove(port_config_file)
-                    print("Port forwarding rules cleaned up")
-                    
-                except Exception as e:
-                    print(f"Warning: Error cleaning up port forwarding: {e}")
+            self._cleanup_port_forwarding()
             
             # Update status
             self.config["status"] = "stopped"
@@ -395,7 +415,7 @@ class SimpleContainer:
         """Clean up any lingering mounts"""
         try:
             rootfs_path = os.path.abspath(self.rootfs)
-            # Find and unmount any lingering mounts in reverse order
+            # Find and unmount lingering mounts in reverse order
             subprocess.run(
                 ["bash", "-c", f"mount | grep {rootfs_path} | awk '{{print $3}}' | sort -r | xargs -r umount -R -f"],
                 check=False
@@ -403,8 +423,67 @@ class SimpleContainer:
         except subprocess.SubprocessError:
             pass
     
+    def _cleanup_port_forwarding(self):
+        """Clean up port forwarding rules"""
+        container_id = os.path.basename(self.rootfs).replace('/', '_')
+        port_config_file = f"/var/run/simple-container/{container_id}/ports.conf"
+        
+        if not os.path.exists(port_config_file):
+            return
+            
+        print(f"Cleaning up port forwarding rules...")
+        try:
+            # Read the port config
+            port_config = {}
+            with open(port_config_file, 'r') as f:
+                for line in f:
+                    if '=' in line:
+                        key, value = line.strip().split('=', 1)
+                        port_config[key] = value
+            
+            # Clean up port forwarding rules
+            if 'PORTS' in port_config and 'CONTAINER_IP' in port_config:
+                ports = port_config['PORTS'].split()
+                container_ip = port_config['CONTAINER_IP']
+                host_interface = port_config.get('HOST_INTERFACE', 'eth0')
+                
+                for port_mapping in ports:
+                    host_port, container_port = port_mapping.split(':')
+                    print(f"Removing port mapping {host_port}:{container_port}")
+                    
+                    # Remove iptables rules
+                    subprocess.run([
+                        'sudo', 'iptables', '-t', 'nat', '-D', 'PREROUTING',
+                        '-p', 'tcp', '--dport', host_port, '-j', 'DNAT',
+                        '--to-destination', f"{container_ip}:{container_port}"
+                    ], stderr=subprocess.DEVNULL, check=False)
+                    
+                    subprocess.run([
+                        'sudo', 'iptables', '-D', 'FORWARD',
+                        '-p', 'tcp', '-d', container_ip, '--dport', container_port,
+                        '-j', 'ACCEPT'
+                    ], stderr=subprocess.DEVNULL, check=False)
+                    
+                    subprocess.run([
+                        'sudo', 'iptables', '-t', 'nat', '-D', 'OUTPUT',
+                        '-p', 'tcp', '-d', '127.0.0.1', '--dport', host_port,
+                        '-j', 'DNAT', '--to-destination', f"{container_ip}:{container_port}"
+                    ], stderr=subprocess.DEVNULL, check=False)
+            
+            # Remove the port config file
+            os.remove(port_config_file)
+            print("Port forwarding rules cleaned up")
+            
+        except Exception as e:
+            print(f"Warning: Error cleaning up port forwarding: {e}")
+    
     def remove(self):
-        """Remove the container"""
+        """
+        Remove the container completely
+        
+        Returns:
+            bool: True if container removed successfully, False otherwise
+        """
         print(f"Removing container {self.name}...")
         
         # Make sure the container is stopped
@@ -416,17 +495,15 @@ class SimpleContainer:
         
         # Remove the container directory
         if os.path.exists(self.container_dir):
-            import shutil
             shutil.rmtree(self.container_dir)
             
         return True
 
     def logs(self):
-        """Get container logs"""
+        """Display container logs from log file"""
         print(f"Fetching logs for container {self.name}...")
         
-        # First, check the container log file
-        container_log = f"/tmp/container.log"
+        container_log = "/tmp/container.log"
         
         if os.path.exists(container_log):
             with open(container_log, 'r') as f:
@@ -435,24 +512,20 @@ class SimpleContainer:
         else:
             print("No logs available")
 
-
     def cleanup_container(self):
-        """Clean up container's resources"""
+        """Clean up all container's resources"""
         if not self.rootfs:
             return
         
-        # Force cleanup any stale network namespaces
-        container_netns = f"netns_{self.rootfs.replace('/', '_')}"
+        # Clean up network namespace
+        container_netns = f"netns_{os.path.basename(self.rootfs).replace('/', '_')}"
         subprocess.run(['sudo', 'ip', 'netns', 'delete', container_netns], 
                     stderr=subprocess.DEVNULL, check=False)
         subprocess.run(['sudo', 'rm', '-f', f'/run/netns/{container_netns}'],
                     stderr=subprocess.DEVNULL, check=False)
         
-        # Force cleanup any stale mounts
-        mounts = subprocess.run(['mount'], capture_output=True, text=True).stdout
+        # Clean up mounts in reverse order
         rootfs_path = self.rootfs
-        
-        # Clean up in reverse order of mounting
         mount_points = [
             f"{rootfs_path}/dev/pts",
             f"{rootfs_path}/dev/shm",
@@ -468,7 +541,7 @@ class SimpleContainer:
             subprocess.run(['sudo', 'umount', '-f', '-l', mount], 
                         stderr=subprocess.DEVNULL, check=False)
         
-        # Remove any stale network interfaces
+        # Clean up network interfaces
         container_id = os.path.basename(self.rootfs).replace('/', '_')[:8]
         veth_host = f"veth_h_{container_id}"
         subprocess.run(['sudo', 'ip', 'link', 'delete', veth_host], 
@@ -482,10 +555,17 @@ class SimpleContainer:
         subprocess.run(['sync'], check=False)
         time.sleep(1)
 
+
 def create_minimal_rootfs(target_dir):
-    """Create a root filesystem"""
-    import shutil
+    """
+    Create a minimal root filesystem using debootstrap
     
+    Args:
+        target_dir: Directory to create the root filesystem in
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
     os.makedirs(target_dir, exist_ok=True)
     
     # Check if debootstrap is available
@@ -501,7 +581,9 @@ def create_minimal_rootfs(target_dir):
         print("Warning: debootstrap not found. Please install a minimal root filesystem manually.")
         return False
 
+
 def main():
+    """Main entry point for the container manager CLI"""
     parser = argparse.ArgumentParser(description="Simple container manager")
     subparsers = parser.add_subparsers(dest="subcommand", help="Commands")
     
@@ -529,7 +611,6 @@ def main():
     start_parser.add_argument('--uid-map', default='0:100000:65536', help='UID mapping in format CONTAINER_UID:HOST_UID:SIZE')
     start_parser.add_argument('--gid-map', default='0:100000:65536', help='GID mapping in format CONTAINER_GID:HOST_GID:SIZE')
 
-   
     # stop
     stop_parser = subparsers.add_parser("stop", help="Stop a container")
     stop_parser.add_argument("--name", required=True, help="Container name")
@@ -555,6 +636,7 @@ def main():
     # Create run directory
     os.makedirs("/var/run/simple-container", exist_ok=True)
     
+    # Handle subcommands
     if args.subcommand == "create":
         container = SimpleContainer(args.rootfs, args.name)
         print(f"Container created: {container.name}")
@@ -567,7 +649,7 @@ def main():
             print("Failed to create root filesystem")
             
     elif args.subcommand == "start":
-        # Find the container config
+        # Find and load the container config
         config_path = f"/var/run/simple-container/{args.name}/config.json"
         if not os.path.exists(config_path):
             print(f"Container {args.name} not found")
@@ -595,7 +677,7 @@ def main():
             sys.exit(1)
             
     elif args.subcommand == "stop":
-        # Find the container config
+        # Find and load the container config
         config_path = f"/var/run/simple-container/{args.name}/config.json"
         if not os.path.exists(config_path):
             print(f"Container {args.name} not found")
@@ -613,7 +695,7 @@ def main():
             sys.exit(1)
             
     elif args.subcommand == "remove":
-        # Find the container config
+        # Find and load the container config
         config_path = f"/var/run/simple-container/{args.name}/config.json"
         if not os.path.exists(config_path):
             print(f"Container {args.name} not found")
@@ -637,18 +719,20 @@ def main():
     elif args.subcommand == "list":
         print("CONTAINER ID\tSTATUS\t\tCREATED\t\t\tROOTFS")
         print("-----------\t------\t\t-------\t\t\t------")
-        if os.path.exists("/var/run/simple-container"):
-            for name in os.listdir("/var/run/simple-container"):
-                config_path = f"/var/run/simple-container/{name}/config.json"
-                if os.path.exists(config_path):
+        container_dir = Path("/var/run/simple-container")
+        if container_dir.exists():
+            for name in os.listdir(container_dir):
+                config_path = container_dir / name / "config.json"
+                if config_path.exists():
                     try:
                         with open(config_path, 'r') as f:
                             config = json.load(f)
                         print(f"{config['id']}\t{config['status']}\t\t{config['created']}\t{config['rootfs']}")
-                    except Exception as e:
+                    except Exception:
                         print(f"{name}\tERROR\t\tUNKNOWN\t\tUNKNOWN")
     else:
         parser.print_help()
+
 
 if __name__ == "__main__":
     main()
